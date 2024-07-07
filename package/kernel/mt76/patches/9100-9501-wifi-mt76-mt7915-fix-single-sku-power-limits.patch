@@ -1,0 +1,183 @@
+--- a/eeprom.c
++++ b/eeprom.c
+@@ -295,7 +295,6 @@ mt76_find_power_limits_node(struct mt76_
+ 	};
+ 	struct device_node *cur, *fallback = NULL;
+ 	const char *region_name = NULL;
+-	char index[4] = {0};
+ 
+ 	if (dev->region < ARRAY_SIZE(region_names))
+ 		region_name = region_names[dev->region];
+@@ -304,20 +303,17 @@ mt76_find_power_limits_node(struct mt76_
+ 	if (!np)
+ 		return NULL;
+ 
+-	snprintf(index, sizeof(index), "%d", phy->sku_idx);
+ 	for_each_child_of_node(np, cur) {
+ 		struct property *country = of_find_property(cur, "country", NULL);
+ 		struct property *regd = of_find_property(cur, "regdomain", NULL);
+-		struct property *sku_index = of_find_property(cur, "sku-index", NULL);
+ 
+ 		if (!country && !regd) {
+ 			fallback = cur;
+ 			continue;
+ 		}
+ 
+-		if ((mt76_string_prop_find(country, dev->alpha2) ||
+-		    mt76_string_prop_find(regd, region_name)) &&
+-		    (!phy->sku_idx || mt76_string_prop_find(sku_index, index))) {
++		if (mt76_string_prop_find(country, dev->alpha2) ||
++		    mt76_string_prop_find(regd, region_name)) { 
+ 			of_node_put(np);
+ 			return cur;
+ 		}
+@@ -400,10 +396,9 @@ mt76_apply_array_limit(s8 *pwr, size_t p
+ static void
+ mt76_apply_multi_array_limit(s8 *pwr, size_t pwr_len, s8 pwr_num,
+ 			     const __be32 *data, size_t len, s8 target_power,
+-			     s8 nss_delta)
++			     s8 nss_delta, s8 *max_power)
+ {
+ 	int i, cur;
+-	s8 max_power = -128;
+ 
+ 	if (!data)
+ 		return;
+@@ -415,7 +410,7 @@ mt76_apply_multi_array_limit(s8 *pwr, si
+ 			break;
+ 
+ 		mt76_apply_array_limit(pwr + pwr_len * i, pwr_len, data + 1,
+-				       target_power, nss_delta, &max_power);
++				       target_power, nss_delta, max_power);
+ 		if (--cur > 0)
+ 			continue;
+ 
+@@ -497,12 +492,12 @@ s8 mt76_get_rate_power_limits(struct mt7
+ 	val = mt76_get_of_array(np, "rates-mcs", &len, mcs_rates + 1);
+ 	mt76_apply_multi_array_limit(dest->mcs[0], ARRAY_SIZE(dest->mcs[0]),
+ 				     ARRAY_SIZE(dest->mcs), val, len,
+-				     target_power, txs_delta);
++				     target_power, txs_delta, &max_power);
+ 
+ 	val = mt76_get_of_array(np, "rates-ru", &len, ru_rates + 1);
+ 	mt76_apply_multi_array_limit(dest->ru[0], ARRAY_SIZE(dest->ru[0]),
+ 				     ARRAY_SIZE(dest->ru), val, len,
+-				     target_power, txs_delta);
++				     target_power, txs_delta, &max_power);
+ 
+ 	max_power_backoff = max_power;
+ 	val = mt76_get_of_array(np, "paths-cck", &len, ARRAY_SIZE(dest->path.cck));
+@@ -520,12 +515,12 @@ s8 mt76_get_rate_power_limits(struct mt7
+ 	val = mt76_get_of_array(np, "paths-ru", &len, ARRAY_SIZE(dest->path.ru[0]) + 1);
+ 	mt76_apply_multi_array_limit(dest->path.ru[0], ARRAY_SIZE(dest->path.ru[0]),
+ 				     ARRAY_SIZE(dest->path.ru), val, len,
+-				     target_power_combine, txs_delta);
++				     target_power_combine, txs_delta, &max_power_backoff);
+ 
+ 	val = mt76_get_of_array(np, "paths-ru-bf", &len, ARRAY_SIZE(dest->path.ru_bf[0]) + 1);
+ 	mt76_apply_multi_array_limit(dest->path.ru_bf[0], ARRAY_SIZE(dest->path.ru_bf[0]),
+ 				     ARRAY_SIZE(dest->path.ru_bf), val, len,
+-				     target_power_combine, txs_delta);
++				     target_power_combine, txs_delta, &max_power_backoff);
+ 
+ 	return max_power;
+ }
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -3473,7 +3473,7 @@ int mt7915_mcu_set_txpower_sku(struct mt
+ 	skb_put_data(skb, &la.cck, len[SKU_CCK]);
+ 
+ 	if (phy->mt76->cap.has_6ghz && mphy->beacon_dup &&
+-	    !mt7915_get_psd_country(dev->mt76.alpha2)) {
++	    mt7915_get_psd_country(dev->mt76.alpha2)) {
+ 		switch (mphy->chandef.width) {
+ 		case NL80211_CHAN_WIDTH_20:
+ 			skb_put_data(skb, &la.mcs[0], len[SKU_OFDM]);
+@@ -3491,6 +3491,10 @@ int mt7915_mcu_set_txpower_sku(struct mt
+ 			skb_put_data(skb, &la.ofdm, len[SKU_OFDM]);
+ 			break;
+ 		}
++
++		//ret = mt7915_mcu_set_lpi(phy, mphy->lpi_enable);
++		//if (ret)
++		//	dev_info(dev->mt76.dev, "%s: failed to enable LPI mode", __func__);
+ 	} else {
+ 		skb_put_data(skb, &la.ofdm, len[SKU_OFDM]);
+ 	}
+@@ -3635,9 +3639,13 @@ int mt7915_mcu_set_lpi(struct mt7915_phy
+ 		u8 psd_limit;
+ 		u8 _rsv[2];
+ 	} __packed req = {
+-		.enable = en,
++		.enable = 0,
+ 		.psd_limit = en ? mt7915_get_psd_country(mdev->alpha2) : 0,
+ 	};
++
++	dev_info(mdev->dev, "%s: enable = %d, psd_limit = %d",
++			__func__, req.enable, req.psd_limit);
++
+ 	return mt76_mcu_send_msg(mdev, MCU_EXT_CMD(LPI_CTRL), &req,
+ 				 sizeof(req), false);
+ }
+@@ -3688,7 +3696,7 @@ int mt7915_mcu_set_sku_en(struct mt7915_
+ 	if (ret)
+ 		return ret;
+ 
+-	pr_info("%s: sku enable = %d, path enable = %d\n", __func__,
++	dev_info(dev->mt76.dev, "%s: sku enable = %d, path enable = %d\n", __func__,
+ 		sku_disable ? 0 : phy->sku_limit_en, sku_disable ? 0 : phy->sku_path_en);
+ 
+ 	req.sku_enable = sku_disable ? 0 : phy->sku_path_en;
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -287,7 +287,7 @@ static void __mt7915_init_txpower(struct
+ 	struct device_node *np;
+ 
+ 	phy->sku_limit_en = true;
+-	phy->sku_path_en = true;
++	phy->sku_path_en = false;
+ 	np = mt76_find_power_limits_node(phy->mt76);
+ 	for (i = 0; i < sband->n_channels; i++) {
+ 		struct ieee80211_channel *chan = &sband->channels[i];
+@@ -307,8 +307,8 @@ static void __mt7915_init_txpower(struct
+ 							  target_power);
+ 
+ 		/* MT7915N can not enable Backoff table without setting value in dts */
+-		if (!limits.path.ofdm[0])
+-			phy->sku_path_en = false;
++		if (limits.path.ofdm[0])
++			phy->sku_path_en = true;
+ 
+ 		target_power += nss_delta;
+ 		target_power = DIV_ROUND_UP(target_power, 2);
+@@ -334,7 +334,9 @@ void mt7915_init_txpower(struct mt7915_p
+ 		__mt7915_init_txpower(phy, &phy->mt76->sband_5g.sband);
+ 	if (phy->mt76->cap.has_6ghz) {
+ 		__mt7915_init_txpower(phy, &phy->mt76->sband_6g.sband);
++		phy->mt76->lpi_enable = 1;
+ 		phy->mt76->beacon_dup = 1;
++		phy->mt76->mgmt_pwr_enhance = 0;
+ 	}
+ }
+ 
+--- a/mt76.h
++++ b/mt76.h
+@@ -849,6 +849,7 @@ struct mt76_phy {
+ 	u8 macaddr[ETH_ALEN];
+ 
+ 	int txpower_cur;
++	u8 lpi_enable;
+ 	u8 beacon_dup;
+ 	u8 mgmt_pwr_enhance;
+ 	u8 sku_idx;
+--- a/mt7915/vendor.c
++++ b/mt7915/vendor.c
+@@ -958,6 +958,8 @@ static int mt7915_vendor_txpower_ctrl(st
+ 			err = mt7915_mcu_set_lpi(phy, val);
+ 			if (err)
+ 				return err;
++
++			mphy->lpi_enable = val;
+ 		}
+ 	}
+ 
